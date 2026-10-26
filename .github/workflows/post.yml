@@ -1,0 +1,35 @@
+name: scheduled-post
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"   # 30分ごと（非公開リポジトリの無料枠に収まる間隔。GitHub側の混雑で数分遅れることがあります）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scheduled-post
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python post_scheduler.py
+        env:
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+      - name: 投稿済みの記録を保存
+        if: always()
+        run: |
+          git config user.name "scheduled-post-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json 2>/dev/null || true
+          git diff --cached --quiet || (git commit -m "投稿済みの記録を更新" && git push)
