@@ -73,7 +73,10 @@ def post(session, row):
     body = {"text": row["text"]}
     image = row.get("image", "").strip()
     if image:
-        body["media"] = {"media_ids": [upload_image(session, image)]}
+        try:
+            body["media"] = {"media_ids": [upload_image(session, image)]}
+        except Exception as e:  # 画像だけ失敗したときは文字だけで投稿する
+            print(f"[WARN] {row['id']}: 画像を付けられませんでした: {e}", file=sys.stderr)
     res = session.post("https://api.x.com/2/tweets", json=body)
     res.raise_for_status()
     return res.json()["data"]["id"]
