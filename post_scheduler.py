@@ -7,6 +7,7 @@ import csv
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -69,12 +70,69 @@ def upload_image(session, path):
     return res.json()["data"]["id"]
 
 
+VIDEO_TYPES = {".mp4": "video/mp4", ".mov": "video/quicktime"}
+CHUNK_SIZE = 4 * 1024 * 1024  # X の推奨は1回5MB以下
+PROCESSING_TIMEOUT = 600  # 動画の変換待ちの上限（秒）
+
+
+def is_video(path):
+    return Path(path).suffix.lower() in VIDEO_TYPES
+
+
+def upload_video(session, path):
+    """動画を分割アップロードし、X側の変換が終わるまで待って media id を返す。"""
+    file = ROOT / path
+    total = file.stat().st_size
+    res = session.post(
+        "https://api.x.com/2/media/upload/initialize",
+        json={
+            "media_type": VIDEO_TYPES[file.suffix.lower()],
+            "total_bytes": total,
+            "media_category": "tweet_video",
+        },
+    )
+    res.raise_for_status()
+    media_id = res.json()["data"]["id"]
+
+    with open(file, "rb") as f:
+        index = 0
+        while chunk := f.read(CHUNK_SIZE):
+            res = session.post(
+                f"https://api.x.com/2/media/upload/{media_id}/append",
+                data={"segment_index": index},
+                files={"media": chunk},
+            )
+            res.raise_for_status()
+            index += 1
+
+    res = session.post(f"https://api.x.com/2/media/upload/{media_id}/finalize")
+    res.raise_for_status()
+    info = res.json().get("data", {}).get("processing_info")
+    deadline = time.monotonic() + PROCESSING_TIMEOUT
+    while info and info.get("state") in ("pending", "in_progress"):
+        if time.monotonic() > deadline:
+            raise RuntimeError("動画の変換が時間内に終わりませんでした")
+        time.sleep(max(1, int(info.get("check_after_secs", 5))))
+        res = session.get(
+            "https://api.x.com/2/media/upload",
+            params={"command": "STATUS", "media_id": media_id},
+        )
+        res.raise_for_status()
+        info = res.json().get("data", {}).get("processing_info")
+    if info and info.get("state") == "failed":
+        raise RuntimeError(f"Xが動画を受け付けませんでした: {info.get('error', info)}")
+    return media_id
+
+
 def post(session, row):
     body = {"text": row["text"]}
-    image = row.get("image", "").strip()
-    if image:
+    media = (row.get("image") or "").strip()
+    if media and is_video(media):
+        # 動画は失敗したら投稿自体をやめる（文字だけのShorts告知になるのを防ぐ）
+        body["media"] = {"media_ids": [upload_video(session, media)]}
+    elif media:
         try:
-            body["media"] = {"media_ids": [upload_image(session, image)]}
+            body["media"] = {"media_ids": [upload_image(session, media)]}
         except Exception as e:  # 画像だけ失敗したときは文字だけで投稿する
             print(f"[WARN] {row['id']}: 画像を付けられませんでした: {e}", file=sys.stderr)
     res = session.post("https://api.x.com/2/tweets", json=body)
@@ -93,7 +151,13 @@ def main():
 
     for row, slot in due_posts(rows, state, now):
         if dry_run:
-            print(f"[DRY RUN] {row['id']} ({slot:%Y-%m-%d %H:%M}): {row['text']}")
+            media = (row.get("image") or "").strip()
+            note = ""
+            if media:
+                kind = "動画" if is_video(media) else "画像"
+                missing = "" if (ROOT / media).exists() else " ※ファイルが見つかりません"
+                note = f" [{kind}: {media}{missing}]"
+            print(f"[DRY RUN] {row['id']} ({slot:%Y-%m-%d %H:%M}){note}: {row['text']}")
             continue
         try:
             tweet_id = post(session, row)
